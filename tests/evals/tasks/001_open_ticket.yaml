@@ -1,0 +1,21 @@
+id: 001_open_ticket
+description: >
+  Open a high-priority service ticket for a company experiencing email outage,
+  assign to on-call engineer, log 15 minutes of triage time.
+tags: [tier2, create, time, write]
+
+prompt: >
+  A customer at Verve IT reports email is down for the whole office.
+  Open a high-priority ticket on the Service board, assign it to John,
+  and log 15 minutes of triage time.
+
+checks:
+  - type: ticket_exists
+    fields:
+      priority/name: Priority 1   # or whatever "high" resolves to
+      board/name: Service
+      closedFlag: false
+  - type: time_entry_exists
+    fields:
+      actualHours: 0.25
+      billableOption: Billable

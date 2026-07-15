@@ -1,0 +1,6 @@
+fastmcp>=3.4.2
+httpx>=0.28.1
+azure-identity>=1.25.2
+azure-keyvault-secrets>=4.10.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.3
