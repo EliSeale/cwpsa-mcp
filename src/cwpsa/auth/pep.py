@@ -80,15 +80,15 @@ class PEPMiddleware(Middleware):
         context: MiddlewareContext,
         call_next: Any,
     ) -> Any:
-        tool_name = "unknown"
-        try:
-            tool_name = context.message.params.name  # type: ignore[union-attr]
-        except Exception:
-            pass
+        tool_name = getattr(context.message, "name", None) or "unknown"
 
         principal = _extract_principal(context)
         upn = _extract_upn(context)
         arg_shape = _extract_arg_shape(context)
+
+        # --- DEBUG probe (remove or gate once auth verified) ---
+        log.warning("[pep] tool=%s principal=%s upn=%s has_claims=%s",
+                    tool_name, principal, upn, bool(_claims()))
 
         # 1. Global write kill-switch (belt-and-suspenders over per-tool auth=)
         if _is_write_tool(tool_name):
@@ -268,7 +268,7 @@ def _extract_upn(context: MiddlewareContext) -> str | None:
 def _extract_arg_shape(context: MiddlewareContext) -> dict[str, str]:
     """Return argument shape (names + types) — no values logged (§12.3 PII rule)."""
     try:
-        args: dict[str, Any] = context.message.params.arguments or {}  # type: ignore
+        args: dict[str, Any] = getattr(context.message, "arguments", None) or {}
         return {k: type(v).__name__ for k, v in args.items()}
     except Exception:
         return {}
@@ -277,7 +277,7 @@ def _extract_arg_shape(context: MiddlewareContext) -> dict[str, str]:
 def _extract_entity_arg(context: MiddlewareContext) -> str | None:
     """Extract the 'entity' argument if present (safe to log — it's a path, not data)."""
     try:
-        args = context.message.params.arguments or {}  # type: ignore
+        args = getattr(context.message, "arguments", None) or {}
         return args.get("entity")
     except Exception:
         return None

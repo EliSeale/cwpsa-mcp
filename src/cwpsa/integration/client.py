@@ -248,28 +248,37 @@ class _WaitRetryAfterOrExponential:
 # HTTP client singleton
 # ---------------------------------------------------------------------------
 
+# Bound to the event loop it was created on. A module-level AsyncClient created on
+# one loop (e.g. the throwaway loop from asyncio.run(warm_vocabulary) at startup, or a
+# per-request loop under stateless_http) and reused on another raises
+# "RuntimeError: Event loop is closed". Recreate whenever the running loop changes.
 _client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def get_client() -> httpx.AsyncClient:
-    """Return the shared async CW HTTP client (no baked-in auth — per-request only)."""
-    global _client
-    if _client is None:
+    """Return an async CW HTTP client bound to the *current* running loop.
+
+    No baked-in auth — credentials are injected per-request via _request_auth (§10.6).
+    """
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
         _client = httpx.AsyncClient(
             base_url=config.CW_BASE_URL,
-            # No auth= here — credentials are minted per-user by the broker (§10.6)
-            # and injected per-request via _request_auth context var.
             timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
         )
+        _client_loop = loop
     return _client
 
 
 async def close_client() -> None:
-    global _client
+    global _client, _client_loop
     if _client is not None:
         await _client.aclose()
         _client = None
+        _client_loop = None
 
 
 # ---------------------------------------------------------------------------

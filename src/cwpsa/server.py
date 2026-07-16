@@ -148,6 +148,7 @@ def create_server() -> FastMCP:
     """Build and configure the FastMCP MCP server."""
     from cwpsa.auth.entra import build_auth_provider
     from cwpsa.auth.pep import PEPMiddleware
+    from cwpsa.auth.debug import DebugMiddleware
     from cwpsa.integration.client import get_circuit_state
     from cwpsa.observability.tracing import setup_tracing
     from cwpsa.observability.metrics import setup_metrics
@@ -174,7 +175,10 @@ def create_server() -> FastMCP:
         instructions=instructions,
     )
 
-    # 6. PEP middleware — audit logging + kill-switch enforcement
+    # 6. Middleware — DEBUG (verbose request/auth logging; CW_DEBUG_AUTH=0 to disable)
+    #    runs first so it logs even when the PEP short-circuits.
+    mcp.add_middleware(DebugMiddleware())
+    # PEP middleware — audit logging + kill-switch + §10.6 broker + §8.3 quota
     mcp.add_middleware(PEPMiddleware())
 
     # 7. Health endpoint (§12.4)
