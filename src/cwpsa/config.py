@@ -161,7 +161,7 @@ ENTRA_REQUIRED_SCOPES: list[str] | None = (
 # ---------------------------------------------------------------------------
 REGISTRY_PATH: str = os.getenv("CW_REGISTRY_PATH", "registry.json")
 LOAD_VOCABULARY: bool = os.getenv("CW_LOAD_VOCABULARY", "1") != "0"
-WRITES_DISABLED: bool = os.getenv("CW_WRITES_DISABLED", "0") != "0"
+WRITES_DISABLED: bool = os.getenv("CW_WRITES_DISABLED", "0").lower() in ("1", "true", "yes", "on")
 OKF_BUNDLE_PATH: str = os.getenv("OKF_BUNDLE_PATH", "business-knowledge")
 REDIS_URL: str | None = os.getenv("REDIS_URL")
 

@@ -66,6 +66,11 @@ def clear_request_credentials() -> None:
 # Domain exceptions (used to steer the circuit breaker)
 # ---------------------------------------------------------------------------
 
+class _ScopingRequiredError(Exception):
+    """Raised when an authenticated request reached the CW client with no per-user
+    credentials — a fail-closed guard so we never call ConnectWise unauthenticated."""
+
+
 class _CWUnavailableError(Exception):
     """CW server error (5xx) or network failure — counts toward circuit breaker trips."""
 
@@ -310,7 +315,16 @@ async def _execute(
                 set_request_credentials(auth, user_type="member")
             except (BrokerNotConfigured, IdentityUnmapped, MintFailed) as e:
                 log.warning("[client] dev UPN mint failed (%s) — no auth for this call", e)
+        elif _cfg.ENTRA_TENANT_ID:
+            # Authenticated deployment (HTTP + Entra): a missing per-request credential
+            # means scoping was NOT established. Fail closed — never call CW unauthenticated.
+            raise _ScopingRequiredError(
+                "No per-request ConnectWise credentials for this call. "
+                "Per-user scoping must be established by the PEP before any CW call "
+                "(§10.6 fail-closed)."
+            )
         else:
+            # Genuine local stdio dev without Entra and without CW_DEV_UPN.
             log.warning(
                 "[client] no per-request auth and CW_DEV_UPN not set — "
                 "CW calls will be unauthenticated. Set CW_DEV_UPN in .env for local dev."

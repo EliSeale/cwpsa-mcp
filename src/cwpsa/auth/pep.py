@@ -34,6 +34,7 @@ import time
 from typing import Any
 
 from fastmcp.server.auth import AuthContext, require_scopes
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from cwpsa.observability.audit import log_tool_call
@@ -105,13 +106,17 @@ class PEPMiddleware(Middleware):
                 return write_disabled()
 
         # 2. §10.6 Token broker — resolve Entra identity → CW member → minted keys.
-        #    Fail-closed: unmapped identity or mint failure → deny all data.
+        #    Fail-closed (§10.3/§10.6): in an authenticated (HTTP) request, ANY failure
+        #    to establish per-user scoping denies all data. Only genuine unauthenticated
+        #    local stdio (no token at all) is allowed to proceed without per-user creds.
         from cwpsa.cache.token_broker import (
             BrokerNotConfigured, IdentityUnmapped, MintFailed, get_broker,
         )
         from cwpsa.integration.client import set_request_credentials
         import httpx
         from cwpsa import config as _cfg
+
+        authenticated = bool(_claims())  # a validated Entra token is present on this request
 
         if upn:
             try:
@@ -123,9 +128,16 @@ class PEPMiddleware(Middleware):
                 set_request_credentials(member_auth, user_type="member")
                 log.debug("[pep] credentials set for UPN '%s' (member %s)", upn, creds.member_identifier)
             except BrokerNotConfigured:
-                # Local stdio dev without integrator credentials — proceed without auth.
-                # In HTTP mode with Entra auth, this should never happen.
-                log.debug("[pep] broker not configured — proceeding without per-user credentials (local dev)")
+                if authenticated:
+                    log.error("[pep] broker not configured on an authenticated request — denying")
+                    log_tool_call(
+                        tool=tool_name, principal=principal, arg_shape=arg_shape,
+                        status="denied:impersonation_unavailable", latency_ms=0,
+                    )
+                    from cwpsa.errors import impersonation_unavailable
+                    return impersonation_unavailable("token broker not configured")
+                # else: genuine local stdio dev without integrator creds — allowed
+                log.debug("[pep] broker not configured — local stdio, proceeding without per-user creds")
             except IdentityUnmapped as exc:
                 log_tool_call(
                     tool=tool_name, principal=principal, arg_shape=arg_shape,
@@ -141,6 +153,17 @@ class PEPMiddleware(Middleware):
                 )
                 from cwpsa.errors import impersonation_unavailable
                 return impersonation_unavailable(exc.reason)
+        elif authenticated:
+            # Valid token but no UPN claim → app-only / client-credentials token.
+            # There is no user to impersonate; fail closed rather than run unscoped.
+            log.warning("[pep] authenticated request with no UPN claim (app-only token) — denying")
+            log_tool_call(
+                tool=tool_name, principal=principal, arg_shape=arg_shape,
+                status="denied:identity_unmapped", latency_ms=0,
+            )
+            from cwpsa.errors import identity_unmapped
+            return identity_unmapped(None)
+        # else: no token at all AND not authenticated → genuine local stdio, allowed.
 
         # 3. §8.3 Edge self-protection — check and acquire quota slot
         from cwpsa.cache.edge_quota import QuotaExceeded, check_and_acquire, release
@@ -195,41 +218,51 @@ def _is_write_tool(name: str) -> bool:
     return name in _WRITE_TOOLS
 
 
-def _extract_principal(context: MiddlewareContext) -> str:
-    """Get the authenticated principal ID (object ID or client_id) from the FastMCP context."""
+def _claims() -> dict:
+    """Signature-verified JWT claims for the current request, or {} if no token.
+
+    Reads the request-scoped AccessToken populated by AzureJWTVerifier. Never
+    pokes FastMCP internals; never silently swallows without logging.
+    """
     try:
-        if context.fastmcp_context and context.fastmcp_context.client_id:
-            return context.fastmcp_context.client_id
-    except Exception:
-        pass
-    return "anonymous"
+        token = get_access_token()
+    except Exception:  # no auth context (stdio) or dependency unavailable
+        return {}
+    if token is None:
+        return {}
+    claims = getattr(token, "claims", None)
+    if claims:
+        return claims
+    # Fallback for versions that expose the raw JWT but not decoded claims.
+    raw = getattr(token, "token", None)
+    if raw:
+        try:
+            import jwt  # PyJWT
+            return jwt.decode(raw, options={"verify_signature": False})
+        except Exception:
+            log.exception("[pep] failed to decode access token claims")
+    return {}
+
+
+def _extract_principal(context: MiddlewareContext) -> str:
+    """Stable per-user principal id from the validated token (oid preferred)."""
+    c = _claims()
+    return c.get("oid") or c.get("sub") or c.get("azp") or "anonymous"
 
 
 def _extract_upn(context: MiddlewareContext) -> str | None:
-    """Extract the Entra UPN (upn or preferred_username claim) from the validated JWT.
+    """Entra UPN from the validated JWT, used by the broker for the office365.name join.
 
-    The UPN is used by the token broker to resolve the CW member identity (§10.6).
-    Returns None in stdio/local mode where no JWT is present.
+    Returns None only when there is genuinely no user identity in the token
+    (no token = local stdio; token-without-upn = app-only, handled by the PEP).
     """
-    try:
-        # FastMCP stores the validated AccessToken on the session; claims dict
-        # comes from the JWT payload (already signature-verified by AzureJWTVerifier).
-        token = getattr(context.fastmcp_context, "_session", None)
-        if token is None:
-            return None
-        # Try to get claims from the FastMCP AccessToken
-        access_token = getattr(token, "access_token", None) or getattr(token, "_access_token", None)
-        if access_token and hasattr(access_token, "claims"):
-            claims = access_token.claims
-            return (
-                claims.get("upn")
-                or claims.get("preferred_username")
-                or claims.get("unique_name")
-                or claims.get("email")
-            )
-    except Exception:
-        pass
-    return None
+    c = _claims()
+    return (
+        c.get("upn")
+        or c.get("preferred_username")
+        or c.get("unique_name")
+        or c.get("email")
+    )
 
 
 def _extract_arg_shape(context: MiddlewareContext) -> dict[str, str]:
@@ -248,4 +281,3 @@ def _extract_entity_arg(context: MiddlewareContext) -> str | None:
         return args.get("entity")
     except Exception:
         return None
-
