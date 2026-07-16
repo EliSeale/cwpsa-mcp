@@ -6,7 +6,9 @@ FastMCP's AzureJWTVerifier validates:
   - audience (api://{client_id} — the confused-deputy defense)
   - signature (Entra JWKS — no app secret needed)
   - expiry
-  - required scopes (MCP.Tools.Read / MCP.Tools.Write)
+  - required scopes: ENTRA_REQUIRED_SCOPES (server-wide baseline, e.g. mcp.read).
+    The WRITE scope (mcp.write) is NOT enforced here — it is a per-tool gate
+    (write_auth_check), so read-only tokens can still use read tools.
 
 No Dynamic Client Registration — pre-registered clients only (§12.1).
 

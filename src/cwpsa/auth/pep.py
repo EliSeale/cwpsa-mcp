@@ -3,7 +3,8 @@ Policy Enforcement Point (PEP) — FastMCP Middleware (§10.3).
 
 Three-layer enforcement:
   1. Per-tool auth check via FastMCP's native `auth=` parameter (§4.5).
-     Write/delete tools declare `auth=write_auth_check` at registration.
+     Write/delete tools declare `auth=write_auth_check` at registration
+     (requires config.ENTRA_WRITE_SCOPE, default "mcp.write").
 
   2. PEPMiddleware — FastMCP Middleware subclass wired via mcp.add_middleware().
      Intercepts every tool call for:
@@ -47,19 +48,23 @@ log = logging.getLogger(__name__)
 
 
 def write_auth_check(ctx: AuthContext) -> bool:
-    """Allow write tools when the principal has MCP.Tools.Write scope.
+    """Allow write tools when the token carries the configured write scope.
 
-    In stdio / local mode (ctx.token is None) all operations are allowed —
-    local dev runs without Entra auth.  In HTTP mode a valid token with the
-    write scope is required.
+    Local / stdio mode (ctx.token is None) is allowed — no Entra auth there.
+    In HTTP mode a validated token must include ``config.ENTRA_WRITE_SCOPE``
+    (default "mcp.write"). Entra emits scopes bare in the `scp` claim, and
+    FastMCP exposes them on ``token.scopes`` as bare names (e.g. "mcp.write"),
+    which is what this compares against — the ``api://<client_id>/`` prefix is
+    only used when the client *requests* the scope, never in the issued token.
     """
     if ctx.token is None:
-        return True  # stdio mode — no auth enforced
-    return "MCP.Tools.Write" in set(ctx.token.scopes)
+        return True  # stdio / local dev — no auth enforced
+    from cwpsa import config
+    return config.ENTRA_WRITE_SCOPE in set(ctx.token.scopes or [])
 
 
 def delete_auth_check(ctx: AuthContext) -> bool:
-    """Allow delete tools. Phase 1: same scope as write (MCP.Tools.Write)."""
+    """Allow delete tools. Phase 1: same scope as write (config.ENTRA_WRITE_SCOPE)."""
     return write_auth_check(ctx)
 
 

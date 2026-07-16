@@ -156,6 +156,15 @@ ENTRA_REQUIRED_SCOPES: list[str] | None = (
     _raw_scopes.replace(",", " ").split() or None
 ) if _raw_scopes else None
 
+# Per-tool WRITE scope, checked by write_auth_check on mutating tools (§10.3).
+# This is a PER-TOOL gate, deliberately kept OUT of ENTRA_REQUIRED_SCOPES so a
+# read-only token (scp: mcp.read) can still call read tools; only writes require it.
+# Token scopes arrive bare (e.g. "mcp.write"), so this value is the bare scope name.
+# Override precedence: env ENTRA_WRITE_SCOPE > Key Vault entra-writescope-01-mcp > "mcp.write".
+ENTRA_WRITE_SCOPE: str = os.getenv("ENTRA_WRITE_SCOPE") or get_secret(
+    "entra-writescope-01-mcp", "mcp.write"
+)
+
 # ---------------------------------------------------------------------------
 # Misc feature flags
 # ---------------------------------------------------------------------------
