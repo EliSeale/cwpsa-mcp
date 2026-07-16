@@ -1,9 +1,8 @@
 """
 Unit tests — resilience stack (§8.2, §13.1).
 
-Tests pybreaker circuit breaker behavior, rate limiter, retry logic,
+Tests the pure-asyncio circuit breaker, rate limiter, retry logic,
 and the domain exception → error envelope translation.
-Uses pytest-httpx to mock the ConnectWise HTTP responses.
 """
 
 from __future__ import annotations
@@ -19,8 +18,8 @@ from cwpsa.integration.client import (
     _execute,
     _is_retryable,
     _breaker,
+    CircuitBreakerError,
 )
-import pybreaker
 
 
 class TestDomainExceptions:
@@ -35,7 +34,7 @@ class TestDomainExceptions:
 
 class TestIsRetryable:
     def test_circuit_open_not_retryable(self):
-        exc = pybreaker.CircuitBreakerError()
+        exc = CircuitBreakerError("open")
         assert _is_retryable(exc) is False
 
     def test_rate_limit_is_retryable(self):
@@ -62,13 +61,11 @@ class TestCircuitBreakerConfig:
 
     def test_http_status_error_excluded(self):
         """4xx HTTPStatusError should NOT count toward the breaker failure threshold."""
-        excludes = _breaker._excluded_exceptions or []
-        assert httpx.HTTPStatusError in excludes
+        assert httpx.HTTPStatusError in _breaker._exclude
 
     def test_rate_limit_error_excluded(self):
         """429 _RateLimitError should NOT count toward the breaker failure threshold."""
-        excludes = _breaker._excluded_exceptions or []
-        assert _RateLimitError in excludes
+        assert _RateLimitError in _breaker._exclude
 
 
 class TestSlidingWindowRateLimiter:

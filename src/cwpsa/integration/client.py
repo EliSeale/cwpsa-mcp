@@ -7,7 +7,8 @@ ConnectWise HTTP client with the four resilience patterns (§8.2):
 
 Components:
   1. Timeout        — httpx per-request timeout (30 s connect + read)
-  2. Circuit breaker — pybreaker; trips after 5 consecutive 5xx/network failures;
+  2. Circuit breaker — pure-asyncio (replaces pybreaker which requires tornado);
+                       trips after 5 consecutive 5xx/network failures;
                        half-open after 60 s; excluded: 4xx (client error) + 429
   3. Bulkhead       — anyio.CapacityLimiter; max 20 concurrent outbound calls
   4. Retry          — tenacity; up to 3 attempts; Retry-After-aware backoff + jitter;
@@ -26,7 +27,6 @@ from typing import Any
 
 import anyio
 import httpx
-import pybreaker
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from cwpsa import config
@@ -79,12 +79,83 @@ class _RateLimitError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# 1. Circuit breaker
+# 1. Circuit breaker — pure asyncio, no tornado dependency
 # ---------------------------------------------------------------------------
 # Trips after 5 consecutive failures (5xx / network).
 # 4xx (client errors) and 429 are EXCLUDED — they don't count as CW failures.
 
-_breaker = pybreaker.CircuitBreaker(
+
+class CircuitBreakerError(Exception):
+    """Raised when the circuit is OPEN (fast-fail path)."""
+
+
+class _AsyncCircuitBreaker:
+    """Minimal async-native circuit breaker (CLOSED → OPEN → HALF-OPEN → CLOSED).
+
+    Excluded exception types are re-raised but do NOT increment the failure counter
+    or contribute to tripping the breaker (e.g. 4xx client errors, 429 rate-limit).
+    """
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half-open"
+
+    def __init__(
+        self,
+        fail_max: int = 5,
+        reset_timeout: float = 60.0,
+        exclude: list | None = None,
+        name: str = "circuit",
+    ) -> None:
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self._exclude: list = list(exclude or [])
+        self.name = name
+        self._state = self.CLOSED
+        self._failures = 0
+        self._last_failure_time = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def current_state(self) -> str:
+        if self._state == self.OPEN:
+            if time.monotonic() - self._last_failure_time >= self.reset_timeout:
+                return self.HALF_OPEN
+        return self._state
+
+    async def call_async(self, func, *args, **kwargs):
+        """Call `func` through the breaker.  Raises CircuitBreakerError when OPEN."""
+        state = self.current_state
+        if state == self.OPEN:
+            raise CircuitBreakerError(
+                f"Circuit breaker '{self.name}' is OPEN — ConnectWise temporarily unavailable."
+            )
+        try:
+            result = await func(*args, **kwargs)
+            # Successful call in HALF-OPEN → close the breaker
+            if state == self.HALF_OPEN:
+                async with self._lock:
+                    self._state = self.CLOSED
+                    self._failures = 0
+                log.info("[circuit] %s: recovered → closed", self.name)
+            return result
+        except Exception as exc:
+            # Excluded exception types don't count as failures
+            if any(isinstance(exc, cls) for cls in self._exclude):
+                raise
+            async with self._lock:
+                self._failures += 1
+                self._last_failure_time = time.monotonic()
+                if self._failures >= self.fail_max:
+                    self._state = self.OPEN
+                    log.warning(
+                        "[circuit] %s: OPEN after %d consecutive failures",
+                        self.name, self._failures,
+                    )
+            raise
+
+
+_breaker = _AsyncCircuitBreaker(
     fail_max=5,
     reset_timeout=60,
     exclude=[httpx.HTTPStatusError, _RateLimitError],
@@ -148,7 +219,7 @@ _rate_limiter = _SlidingWindowRateLimiter(max_per_minute=900)
 
 def _is_retryable(exc: BaseException) -> bool:
     """Return True if the exception warrants a retry."""
-    if isinstance(exc, pybreaker.CircuitBreakerError):
+    if isinstance(exc, CircuitBreakerError):
         return False  # circuit open — fast-fail, never retry
     if isinstance(exc, _RateLimitError):
         return True   # 429 — wait then retry

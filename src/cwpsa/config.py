@@ -9,10 +9,10 @@ Two modes:
                 CW_LOCAL_SECRETS=1 to fall back to env-vars / .env for each secret.
 
 Secret names in Key Vault (§12.1):
-  CWPSA-Integrator-Username  -- Integrator Login username  (x-cw-usertype: integrator)
-  CWPSA-Integrator-Password  -- Integrator Login password
-  CWPSA-company-id           -- ConnectWise company identifier  (e.g. "mettle")
-  CWPSA-client-id            -- clientId header value (integration app-id)
+  cw-integratorusername-01-mcp  -- Integrator Login username  (x-cw-usertype: integrator)
+  cw-integratorpassword-01-mcp  -- Integrator Login password
+  cw-companyId-01-mcp           -- ConnectWise company identifier  (e.g. "mettle")
+  cw-clientid-01-mcp            -- clientId header value (integration app-id)
 
 Two-hop credential model (§10.4/§10.6):
   Hop 1 — member lookup:  API member keys (cw-publickey-01-mcp / cw-privatekey-01-mcp)
@@ -92,8 +92,8 @@ if "/v4_6_release/apis/3.0" not in _cw_base:
     _cw_base += "/v4_6_release/apis/3.0"
 CW_BASE_URL: str = _cw_base
 
-CW_COMPANY: str = get_secret("CWPSA-company-id", os.getenv("CW_COMPANY", ""))
-CW_CLIENT_ID: str = get_secret("CWPSA-client-id")
+CW_COMPANY: str = get_secret("cw-companyId-01-mcp", os.getenv("CW_COMPANY", ""))
+CW_CLIENT_ID: str = get_secret("cw-clientid-01-mcp")
 CW_API_VERSION: str = get_secret("CWPSA-api-version", "2022.1")
 
 # ---------------------------------------------------------------------------
@@ -117,8 +117,8 @@ def member_auth() -> httpx.BasicAuth:
 # Integrator Login — used by the token broker (§10.6) to mint per-user keys.
 # Required for Model C (per-user impersonation).
 # ---------------------------------------------------------------------------
-INTEGRATOR_USERNAME: str = get_secret("CWPSA-Integrator-Username")
-INTEGRATOR_PASSWORD: str = get_secret("CWPSA-Integrator-Password")
+INTEGRATOR_USERNAME: str = get_secret("cw-integratorusername-01-mcp")
+INTEGRATOR_PASSWORD: str = get_secret("cw-integratorpassword-01-mcp")
 
 
 def cw_headers(*, user_type: str = "member") -> dict[str, str]:
@@ -143,7 +143,7 @@ def integrator_auth() -> "httpx.BasicAuth":
 
 # ---------------------------------------------------------------------------
 # Model C / Integrator Login credentials (Phase 5 — token broker §10.4/§10.6)
-# CWPSA-company-id / CWPSA-client-id are the canonical names for these values.
+# cw-companyId-01-mcp / cw-clientid-01-mcp are the canonical names for these values.
 # CW_COMPANY and CW_CLIENT_ID already hold the equivalent values above.
 
 # ---------------------------------------------------------------------------

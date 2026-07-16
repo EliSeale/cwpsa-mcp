@@ -209,8 +209,8 @@ class TokenBroker:
 
         if not config.INTEGRATOR_USERNAME or not config.INTEGRATOR_PASSWORD:
             raise BrokerNotConfigured(
-                "Integrator Login credentials (CWPSA-Integrator-Username / "
-                "CWPSA-Integrator-Password) are not configured."
+                "Integrator Login credentials (cw-integratorusername-01-mcp / "
+                "cw-integratorpassword-01-mcp) are not configured."
             )
 
         cached, lock = await _get_or_create_member_slot(upn)
