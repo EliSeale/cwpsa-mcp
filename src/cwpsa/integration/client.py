@@ -29,6 +29,11 @@ import anyio
 import httpx
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
+try:
+    from fastmcp.server.dependencies import get_http_request
+except Exception:  # pragma: no cover
+    get_http_request = None  # type: ignore
+
 from cwpsa import config
 
 log = logging.getLogger(__name__)
@@ -52,9 +57,21 @@ _request_user_type: contextvars.ContextVar[str] = contextvars.ContextVar(
 def set_request_credentials(
     auth: httpx.BasicAuth, user_type: str = "member"
 ) -> None:
-    """Set per-request CW credentials (called by the token broker after mint, §10.6)."""
+    """Set per-request CW credentials (called by the PEP after mint, §10.6).
+
+    Writes BOTH a contextvar (works for stdio / same-context calls) AND the shared
+    Starlette request object's ``state`` (works across the middleware->tool dispatch
+    hop, where the contextvar set in the PEP frame is NOT reliably visible).
+    """
     _request_auth.set(auth)
     _request_user_type.set(user_type)
+    if get_http_request is not None:
+        try:
+            req = get_http_request()
+            req.state.cw_auth = auth
+            req.state.cw_user_type = user_type
+        except Exception:
+            pass  # no HTTP request (stdio) — contextvar path covers it
 
 
 def clear_request_credentials() -> None:
@@ -300,9 +317,22 @@ async def _execute(
     client = get_client()
     fn = getattr(client, method)
 
-    # Credentials set by the broker for this request
+    # Credentials set by the PEP for this request
     auth = _request_auth.get()
     user_type = _request_user_type.get()
+
+    # Contextvars set in the PEP middleware frame don't reliably survive the
+    # middleware->tool dispatch hop; the shared request object does. Recover here.
+    if auth is None and get_http_request is not None:
+        try:
+            req = get_http_request()
+            state_auth = getattr(req.state, "cw_auth", None)
+            if state_auth is not None:
+                auth = state_auth
+                user_type = getattr(req.state, "cw_user_type", user_type)
+                log.debug("[client] recovered per-request creds from request.state")
+        except Exception:
+            pass
 
     # Local dev fallback: no per-request credentials (no Entra JWT in stdio mode).
     # If CW_DEV_UPN is set, mint member credentials for the dev's own account so

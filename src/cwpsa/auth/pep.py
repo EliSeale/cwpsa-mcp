@@ -186,6 +186,7 @@ class PEPMiddleware(Middleware):
         status = "ok"
         try:
             result = await call_next(context)
+            status = _result_status(result)  # detect tool-returned error envelopes
             return result
         except Exception as exc:
             status = f"error:{type(exc).__name__}"
@@ -216,6 +217,28 @@ _WRITE_TOOLS = frozenset([
 
 def _is_write_tool(name: str) -> bool:
     return name in _WRITE_TOOLS
+
+
+def _result_status(result: Any) -> str:
+    """Best-effort: map a tool result to an audit status.
+
+    Tools return ErrorEnvelope on failure but catch their own exceptions, so
+    call_next returns normally — without this, every failed tool logs "ok".
+    Defensive: unknown shapes fall back to "ok".
+    """
+    try:
+        from cwpsa.errors import ErrorEnvelope
+        if isinstance(result, ErrorEnvelope):
+            return f"error:{result.error.code}"
+        # FastMCP may wrap the return in a ToolResult; inspect its structured content.
+        sc = getattr(result, "structured_content", None)
+        if isinstance(sc, dict) and isinstance(sc.get("error"), dict):
+            return f"error:{sc['error'].get('code', 'unknown')}"
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            return f"error:{result['error'].get('code', 'unknown')}"
+    except Exception:
+        pass
+    return "ok"
 
 
 def _claims() -> dict:
