@@ -1,0 +1,408 @@
+"""
+Tier 2 action tools — convert and child-ticket workflows.
+
+Tools:
+  cw_convert              Convert dispatcher. Ticket routes (service_ticket,
+                          project_ticket) convert to a project and are fully
+                          implemented; opportunity/sales_order routes are on the
+                          backlog and return a clear not-implemented error.
+  cw_set_ticket_parent    Attach tickets as children of a parent, or detach them.
+  cw_convert_ticket_tree  Orchestrated convert of a parent ticket plus its
+                          children: detach all children, then convert the parent
+                          and each former child separately.
+
+All three are write tools: they require the mcp.write scope (auth=write_auth_check),
+honor the CW_WRITES_DISABLED kill-switch, and run under the caller's impersonated
+ConnectWise member (so ConnectWise enforces whether the member may perform the
+action). They follow the prepare/execute pattern: call with partial input to get
+choices, then with confirm=True to act. Names are registered in pep.py _WRITE_TOOLS.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import httpx
+from fastmcp import FastMCP
+
+from cwpsa import config
+from cwpsa.auth.pep import write_auth_check
+from cwpsa.errors import (
+    ErrorEnvelope,
+    not_found,
+    upstream_error,
+    validation_error,
+    write_disabled,
+)
+from cwpsa.integration.client import cw_get as _cw_get, cw_patch, cw_post
+from cwpsa.integration.patch_builder import build_patch, scalar
+from cwpsa.tools.tier2._action import item_result, needs_input, preview
+
+_PROJECT_RECORD_TYPES = ("ProjectTicket", "ProjectIssue", "ServiceTicket")
+
+
+# --------------------------------------------------------------------------- #
+# Internal helpers (shared by the tools below)
+# --------------------------------------------------------------------------- #
+def _as_list(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+
+async def _load_open_projects(company_id: int | None) -> list[dict[str, Any]]:
+    """Candidate projects for a convert: open, optionally scoped to the company."""
+    conditions = ["(closedFlag=False)"]
+    if company_id:
+        conditions.append(f"(company/id={company_id})")
+    data = await _cw_get(
+        "/project/projects",
+        conditions=" and ".join(conditions),
+        fields="id,name,status,manager,company",
+        pageSize=100,
+        orderBy="name asc",
+    )
+    return [
+        {"id": p.get("id"), "name": p.get("name"),
+         "status": (p.get("status") or {}).get("name") if isinstance(p.get("status"), dict) else p.get("status"),
+         "manager": (p.get("manager") or {}).get("name") if isinstance(p.get("manager"), dict) else None}
+        for p in _as_list(data)
+    ]
+
+
+async def _load_phases(project_id: int) -> list[dict[str, Any]]:
+    """Non-closed phases of a project, each carrying its wbsCode.
+
+    A phase has wbsCode + description but no name, so surface both.
+    """
+    data = await _cw_get(
+        f"/project/projects/{project_id}/phases",
+        fields="id,description,wbsCode,status",
+        pageSize=200,
+        orderBy="wbsCode asc",
+    )
+    out: list[dict[str, Any]] = []
+    for p in _as_list(data):
+        st = p.get("status") or {}
+        if isinstance(st, dict) and st.get("closedFlag"):
+            continue  # best-effort: skip closed phases when the flag is present
+        out.append({"id": p.get("id"), "wbsCode": p.get("wbsCode"), "description": p.get("description")})
+    return out
+
+
+async def _convert_one(
+    ticket_id: int,
+    project_id: int,
+    phase_id: int,
+    record_type: str = "ProjectTicket",
+    *,
+    source_base: str = "/service/tickets",
+) -> dict[str, Any]:
+    """Shared convert core: convert one ticket to a project record.
+
+    Reads wbsCode from the chosen phase (the model never supplies it), builds the
+    ConvertToProject body, and POSTs. Idempotent-ish: skips a ticket that already
+    looks like a project record. Returns a per-item result dict.
+    """
+    # 1. Pre-check: re-read the ticket; skip if already a project record.
+    try:
+        current = await _cw_get(f"{source_base}/{ticket_id}", fields="id,recordType")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return item_result(ticket_id, "convert", "skipped",
+                               "not found as a service ticket (may already be converted)")
+        return item_result(ticket_id, "convert", "error", f"pre-check failed: {exc.response.status_code}")
+    except Exception as exc:  # noqa: BLE001
+        return item_result(ticket_id, "convert", "error", f"pre-check failed: {exc}")
+
+    if isinstance(current, dict) and current.get("recordType") in ("ProjectTicket", "ProjectIssue"):
+        return item_result(ticket_id, "convert", "skipped", "already a project record")
+
+    # 2. Fetch the chosen phase; read its wbsCode.
+    try:
+        phase = await _cw_get(f"/project/projects/{project_id}/phases/{phase_id}",
+                              fields="id,wbsCode,description")
+    except Exception as exc:  # noqa: BLE001
+        return item_result(ticket_id, "convert", "error", f"could not read phase {phase_id}: {exc}")
+    wbs = (phase or {}).get("wbsCode")
+    if not wbs:
+        return item_result(ticket_id, "convert", "error", f"phase {phase_id} has no wbsCode")
+
+    # 3. Build the ConvertToProject body and POST.
+    body = {
+        "recordType": record_type,
+        "project": {"id": project_id},
+        "phase": {"id": phase_id},
+        "wbsCode": wbs,
+    }
+    try:
+        await cw_post(f"{source_base}/{ticket_id}/convert", body)
+    except httpx.HTTPStatusError as exc:
+        return item_result(ticket_id, "convert", "error",
+                           f"convert failed: {exc.response.status_code} {exc.response.text[:200]}")
+    except Exception as exc:  # noqa: BLE001
+        return item_result(ticket_id, "convert", "error", f"convert failed: {exc}")
+    return item_result(ticket_id, "convert", "ok",
+                       f"converted to {record_type} under project {project_id}, phase {wbs}")
+
+
+# --------------------------------------------------------------------------- #
+# Registration
+# --------------------------------------------------------------------------- #
+def register(mcp: FastMCP) -> None:
+
+    @mcp.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": True,
+                     "idempotentHint": False, "openWorldHint": False},
+        auth=write_auth_check,
+    )
+    async def cw_convert(
+        source: Literal["service_ticket", "project_ticket", "opportunity", "sales_order"],
+        record_id: int,
+        target: Literal["project", "service_ticket", "sales_order", "agreement"] | None = None,
+        project_id: int | None = None,
+        phase_id: int | None = None,
+        record_type: Literal["ProjectTicket", "ProjectIssue", "ServiceTicket"] | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any] | ErrorEnvelope:
+        """Convert a record to another type (prepare/execute, irreversible).
+
+        Ticket routes (service_ticket, project_ticket) convert to a project and
+        need a project + phase; the server reads the phase's wbsCode for you, so
+        you never supply it. Call without project_id to list candidate projects,
+        then without phase_id to list that project's phases, then with
+        confirm=true to convert.
+
+        Args:
+            source:      Kind of record being converted.
+            record_id:   The source record's id.
+            target:      What to convert into. Ticket routes support only "project".
+            project_id:  Target project (ticket -> project routes).
+            phase_id:    Target phase within the project (ticket -> project routes).
+            record_type: Resulting project record type (default ProjectTicket).
+            confirm:     Must be true to perform the conversion.
+        """
+        if config.WRITES_DISABLED:
+            return write_disabled()
+
+        if source in ("service_ticket", "project_ticket"):
+            base = "/service/tickets" if source == "service_ticket" else "/project/tickets"
+            if target not in (None, "project"):
+                return validation_error(f"source '{source}' can only convert to 'project'.")
+
+            company_id: int | None = None
+            try:
+                tk = await _cw_get(f"{base}/{record_id}", fields="id,company,recordType")
+                company_id = ((tk or {}).get("company") or {}).get("id")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    return not_found(f"{source} #{record_id} not found.")
+                return upstream_error(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                return upstream_error(str(exc))
+
+            if project_id is None:
+                return needs_input(
+                    "convert", missing=["project_id"],
+                    required_fields={"phase": "reference", "wbsCode": "auto-filled from phase"},
+                    choices={"record_type": list(_PROJECT_RECORD_TYPES),
+                             "projects": await _load_open_projects(company_id)},
+                    next_hint="call again with project_id to see that project's phases",
+                )
+            if phase_id is None:
+                phases = await _load_phases(project_id)
+                if not phases:
+                    return validation_error(
+                        f"project {project_id} has no open phases; pick another project or add a phase.")
+                return needs_input(
+                    "convert", missing=["phase_id"], choices={"phases": phases},
+                    next_hint="call again with phase_id and confirm=true to convert",
+                )
+
+            rtype = record_type or "ProjectTicket"
+            if not confirm:
+                return preview(
+                    "convert",
+                    will=f"convert {source} #{record_id} to a {rtype} under project {project_id}, phase {phase_id}",
+                    source=source, record_id=record_id, project_id=project_id,
+                    phase_id=phase_id, record_type=rtype,
+                )
+            result = await _convert_one(record_id, project_id, phase_id, rtype, source_base=base)
+            if result["status"] == "error":
+                return upstream_error(result.get("detail", "convert failed"))
+            return {"status": "completed", "result": result}
+
+        return validation_error(
+            f"convert source '{source}' is not implemented yet. "
+            "Implemented: service_ticket, project_ticket (to project). "
+            "Opportunity and sales-order converts are on the backlog.")
+
+    @mcp.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": False,
+                     "idempotentHint": True, "openWorldHint": False},
+        auth=write_auth_check,
+    )
+    async def cw_set_ticket_parent(
+        ticket_ids: list[int],
+        parent_id: int | None,
+        confirm: bool = False,
+    ) -> dict[str, Any] | ErrorEnvelope:
+        """Attach tickets as children of a parent, or detach them.
+
+        parent_id set  -> attach ticket_ids as children of parent_id.
+        parent_id None -> detach ticket_ids (clear their parent). Reversible.
+
+        Args:
+            ticket_ids: One or more child ticket ids.
+            parent_id:  Parent ticket id, or None to detach.
+            confirm:    Must be true to apply the change.
+        """
+        if config.WRITES_DISABLED:
+            return write_disabled()
+        if not ticket_ids:
+            return validation_error("ticket_ids must contain at least one ticket id.")
+
+        verb = "attach" if parent_id is not None else "detach"
+        if not confirm:
+            target = f"parent #{parent_id}" if parent_id is not None else "no parent (detach)"
+            return preview("set_ticket_parent", will=f"{verb} ticket(s) {ticket_ids} -> {target}",
+                           ticket_ids=ticket_ids, parent_id=parent_id)
+
+        results: list[dict[str, Any]] = []
+        if parent_id is not None:
+            try:
+                await cw_post(f"/service/tickets/{parent_id}/attachChildren",
+                              {"childTicketIds": ticket_ids})
+                results = [item_result(t, "attach", "ok", f"attached to parent {parent_id}")
+                           for t in ticket_ids]
+            except httpx.HTTPStatusError as exc:
+                return upstream_error(
+                    f"attachChildren failed: {exc.response.status_code} {exc.response.text[:200]}")
+            except Exception as exc:  # noqa: BLE001
+                return upstream_error(f"attachChildren failed: {exc}")
+        else:
+            # Detach: null out parentTicketId on each child.
+            # (If a CW version rejects a null replace, switch scalar(...) to op="remove".)
+            for t in ticket_ids:
+                try:
+                    await cw_patch(f"/service/tickets/{t}", build_patch(scalar("parentTicketId", None)))
+                    results.append(item_result(t, "detach", "ok", "parent cleared"))
+                except Exception as exc:  # noqa: BLE001
+                    results.append(item_result(t, "detach", "error", str(exc)))
+
+        ok = sum(1 for r in results if r["status"] == "ok")
+        return {"status": "completed", "results": results,
+                "summary": f"{ok} of {len(ticket_ids)} {verb}ed"}
+
+    @mcp.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": True,
+                     "idempotentHint": False, "openWorldHint": False},
+        auth=write_auth_check,
+    )
+    async def cw_convert_ticket_tree(
+        ticket_id: int,
+        project_id: int | None = None,
+        phase_id: int | None = None,
+        record_type: Literal["ProjectTicket", "ProjectIssue", "ServiceTicket"] | None = None,
+        phase_overrides: dict[str, int] | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any] | ErrorEnvelope:
+        """Convert a parent ticket AND its child tickets to project tickets.
+
+        Detaches every child first, then converts the parent and each former
+        child separately (each becomes its own project ticket). Best-effort with
+        a per-ticket result. Safe to re-run after a partial failure: already
+        detached and already converted records are skipped.
+
+        Args:
+            ticket_id:       The parent service ticket.
+            project_id:      Target project for all of them.
+            phase_id:        Default target phase for the parent and children.
+            record_type:     Resulting project record type (default ProjectTicket).
+            phase_overrides: Optional {child_ticket_id: phase_id} to place a
+                             specific child in a different phase. Keys are ticket ids.
+            confirm:         Must be true to perform the detach + conversions.
+        """
+        if config.WRITES_DISABLED:
+            return write_disabled()
+
+        # Discover children.
+        try:
+            children_data = await _cw_get("/service/tickets",
+                                          conditions=f"(parentTicketId={ticket_id})",
+                                          fields="id,summary,recordType", pageSize=200)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return not_found(f"Ticket #{ticket_id} not found.")
+            return upstream_error(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return upstream_error(str(exc))
+        child_ids = [c["id"] for c in _as_list(children_data) if c.get("id")]
+
+        company_id: int | None = None
+        try:
+            parent = await _cw_get(f"/service/tickets/{ticket_id}", fields="id,company")
+            company_id = ((parent or {}).get("company") or {}).get("id")
+        except Exception:  # noqa: BLE001
+            pass
+
+        if project_id is None:
+            return needs_input("convert_ticket_tree", missing=["project_id"],
+                               choices={"record_type": list(_PROJECT_RECORD_TYPES),
+                                        "projects": await _load_open_projects(company_id),
+                                        "children_found": child_ids},
+                               next_hint="call again with project_id to see phases")
+        if phase_id is None:
+            phases = await _load_phases(project_id)
+            if not phases:
+                return validation_error(
+                    f"project {project_id} has no open phases; pick another project or add a phase.")
+            return needs_input("convert_ticket_tree", missing=["phase_id"],
+                               choices={"phases": phases, "children_found": child_ids},
+                               next_hint="call again with phase_id and confirm=true to run")
+
+        rtype = record_type or "ProjectTicket"
+        if not confirm:
+            return preview(
+                "convert_ticket_tree",
+                will=(f"detach {len(child_ids)} child ticket(s) from #{ticket_id}, then convert "
+                      f"#{ticket_id} and all {len(child_ids)} to {rtype} under project {project_id}, "
+                      f"phase {phase_id} ({len(child_ids) + 1} conversions total)"),
+                parent=ticket_id, children=child_ids, project_id=project_id,
+                phase_id=phase_id, record_type=rtype)
+
+        overrides = {int(k): v for k, v in (phase_overrides or {}).items()}
+
+        # Phase 1: detach ALL children first (parent must have no children when converted).
+        detach_map: dict[int, str] = {}
+        for cid in child_ids:
+            try:
+                cur = await _cw_get(f"/service/tickets/{cid}", fields="id,parentTicketId")
+                if (cur or {}).get("parentTicketId") in (None, 0):
+                    detach_map[cid] = "skipped (already detached)"
+                else:
+                    await cw_patch(f"/service/tickets/{cid}", build_patch(scalar("parentTicketId", None)))
+                    detach_map[cid] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                detach_map[cid] = f"error: {exc}"
+
+        # Phase 2: convert the parent, then each former child.
+        pconv = await _convert_one(ticket_id, project_id, phase_id, rtype)
+        parent_result = {"record_id": ticket_id, "detach": "n/a", "convert": pconv["status"],
+                         **({"detail": pconv["detail"]} if pconv.get("detail") else {})}
+
+        child_results: list[dict[str, Any]] = []
+        for cid in child_ids:
+            d = detach_map.get(cid, "unknown")
+            if d.startswith("error"):
+                child_results.append({"record_id": cid, "detach": d,
+                                      "convert": "skipped (detach failed)"})
+                continue
+            conv = await _convert_one(cid, project_id, overrides.get(cid, phase_id), rtype)
+            child_results.append({"record_id": cid, "detach": d, "convert": conv["status"],
+                                  **({"detail": conv["detail"]} if conv.get("detail") else {})})
+
+        converted = (1 if pconv["status"] == "ok" else 0) + \
+                    sum(1 for r in child_results if r.get("convert") == "ok")
+        return {"status": "completed_with_results", "parent": parent_result,
+                "children": child_results, "summary": f"{converted} of {len(child_ids) + 1} converted"}
