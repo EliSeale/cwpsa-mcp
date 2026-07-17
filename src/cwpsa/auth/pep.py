@@ -223,6 +223,8 @@ _WRITE_TOOLS = frozenset([
     "cw_set_approval",
     # Tier 2 action tools (copy.py)
     "cw_copy_record",
+    # Tier 2 action tools (apply_template.py)
+    "cw_apply_project_template",
 ])
 
 
