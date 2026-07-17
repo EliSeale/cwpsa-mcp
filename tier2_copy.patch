@@ -1,0 +1,138 @@
+diff --git a/src/cwpsa/auth/pep.py b/src/cwpsa/auth/pep.py
+index f4b0648..92e1d64 100644
+--- a/src/cwpsa/auth/pep.py
++++ b/src/cwpsa/auth/pep.py
+@@ -221,6 +221,8 @@ _WRITE_TOOLS = frozenset([
+     "cw_convert", "cw_set_ticket_parent", "cw_convert_ticket_tree",
+     # Tier 2 action tools (approval.py)
+     "cw_set_approval",
++    # Tier 2 action tools (copy.py)
++    "cw_copy_record",
+ ])
+ 
+ 
+diff --git a/src/cwpsa/server.py b/src/cwpsa/server.py
+index 4624b3b..5bef0b5 100644
+--- a/src/cwpsa/server.py
++++ b/src/cwpsa/server.py
+@@ -229,7 +229,7 @@ def _register_tools(mcp: FastMCP) -> None:
+     mutate.register(mcp)
+ 
+     # Tier 2 — workflow tools (deferrable, §4.7)
+-    from cwpsa.tools.tier2 import tickets, companies, time, finance, configurations, sales, convert, approval
++    from cwpsa.tools.tier2 import tickets, companies, time, finance, configurations, sales, convert, approval, copy
+     tickets.register(mcp)
+     companies.register(mcp)
+     time.register(mcp)
+@@ -238,6 +238,7 @@ def _register_tools(mcp: FastMCP) -> None:
+     sales.register(mcp)
+     convert.register(mcp)
+     approval.register(mcp)
++    copy.register(mcp)
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/src/cwpsa/tools/tier2/copy.py b/src/cwpsa/tools/tier2/copy.py
+new file mode 100644
+index 0000000..8522153
+--- /dev/null
++++ b/src/cwpsa/tools/tier2/copy.py
+@@ -0,0 +1,98 @@
++"""
++Tier 2 action tool — copy (duplicate a record).
++
++cw_copy_record duplicates a source record and returns the new one. In the spec
++the copy endpoints take only the source id in the path: no request body, no query
++parameters. This is the degenerate case of the action-tool pattern: there is
++nothing to look up, so prepare scales to zero and the tool is just a confirmed
++execute. Overrides are not part of the copy call, so the model is copy-then-edit:
++copy, get the new id back, then cw_update_* if changes are needed.
++
++Write tool: requires the mcp.write scope (auth=write_auth_check), honors the
++CW_WRITES_DISABLED kill-switch, runs under the caller's impersonated member.
++Copy is not idempotent (calling it twice makes two copies) and these endpoints
++have no idempotency key, so the tool never auto-retries (the client already
++refuses to retry POSTs). The name is registered in pep.py _WRITE_TOOLS.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Literal
++
++import httpx
++from fastmcp import FastMCP
++
++from cwpsa import config
++from cwpsa.auth.pep import write_auth_check
++from cwpsa.errors import ErrorEnvelope, not_found, upstream_error, write_disabled
++from cwpsa.integration.client import cw_get as _cw_get, cw_post
++from cwpsa.tools.tier2._action import preview
++
++# Entities with a bodyless /copy endpoint, and the field(s) to show in the preview.
++_COPY_LABEL_FIELDS = {
++    "service/tickets": "id,summary",
++    "finance/agreements": "id,name",
++    "procurement/purchaseorders": "id,poNumber",
++}
++
++
++def register(mcp: FastMCP) -> None:
++
++    @mcp.tool(
++        annotations={"readOnlyHint": False, "destructiveHint": False,
++                     "idempotentHint": False, "openWorldHint": False},
++        auth=write_auth_check,
++    )
++    async def cw_copy_record(
++        entity: Literal["service/tickets", "finance/agreements", "procurement/purchaseorders"],
++        record_id: int,
++        confirm: bool = False,
++    ) -> dict[str, Any] | ErrorEnvelope:
++        """Duplicate a record. Returns the new record so you can edit the copy.
++
++        The copy call takes no inputs beyond the source, so there is nothing to
++        choose: call with confirm=false to preview what will be copied, then
++        confirm=true to create the duplicate. To change fields on the copy, edit
++        it afterward with the matching update tool (copy-then-edit).
++
++        Args:
++            entity:    The record type to copy.
++            record_id: The source record's id.
++            confirm:   Must be true to create the copy.
++        """
++        if config.WRITES_DISABLED:
++            return write_disabled()
++
++        # Preview: fetch a friendly label for the source so the caller sees what is copied.
++        if not confirm:
++            label: dict[str, Any] = {}
++            try:
++                src = await _cw_get(f"/{entity}/{record_id}", fields=_COPY_LABEL_FIELDS[entity])
++                if isinstance(src, dict):
++                    label = {k: v for k, v in src.items() if k in ("summary", "name", "poNumber")}
++            except httpx.HTTPStatusError as exc:
++                if exc.response.status_code == 404:
++                    return not_found(f"{entity} #{record_id} not found.")
++                return upstream_error(str(exc))
++            except Exception as exc:  # noqa: BLE001
++                return upstream_error(str(exc))
++            return preview("copy_record",
++                           will=f"copy {entity} #{record_id}; a new record will be created",
++                           entity=entity, record_id=record_id, source=label)
++
++        # Execute: bodyless POST to the copy endpoint. Never auto-retried.
++        try:
++            result = await cw_post(f"/{entity}/{record_id}/copy", {})
++        except httpx.HTTPStatusError as exc:
++            if exc.response.status_code == 404:
++                return not_found(f"{entity} #{record_id} not found.")
++            return upstream_error(
++                f"copy failed: {exc.response.status_code} {exc.response.text[:200]}")
++        except Exception as exc:  # noqa: BLE001
++            return upstream_error(f"copy failed: {exc}")
++
++        new_id = result.get("id") if isinstance(result, dict) else None
++        return {"status": "completed", "entity": entity, "source_id": record_id,
++                "new_id": new_id, "new_record": result,
++                "next": f"edit the copy with the matching update tool using id {new_id}"
++                        if new_id else "copy created"}

@@ -229,7 +229,7 @@ def _register_tools(mcp: FastMCP) -> None:
     mutate.register(mcp)
 
     # Tier 2 — workflow tools (deferrable, §4.7)
-    from cwpsa.tools.tier2 import tickets, companies, time, finance, configurations, sales, convert, approval
+    from cwpsa.tools.tier2 import tickets, companies, time, finance, configurations, sales, convert, approval, copy
     tickets.register(mcp)
     companies.register(mcp)
     time.register(mcp)
@@ -238,6 +238,7 @@ def _register_tools(mcp: FastMCP) -> None:
     sales.register(mcp)
     convert.register(mcp)
     approval.register(mcp)
+    copy.register(mcp)
 
 
 # ---------------------------------------------------------------------------
