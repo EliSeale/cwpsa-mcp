@@ -219,6 +219,8 @@ _WRITE_TOOLS = frozenset([
     "cw_log_time",
     # Tier 2 action tools (convert.py)
     "cw_convert", "cw_set_ticket_parent", "cw_convert_ticket_tree",
+    # Tier 2 action tools (approval.py)
+    "cw_set_approval",
 ])
 
 
