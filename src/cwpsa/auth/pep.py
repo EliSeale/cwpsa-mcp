@@ -91,9 +91,11 @@ class PEPMiddleware(Middleware):
         upn = _extract_upn(context)
         arg_shape = _extract_arg_shape(context)
 
-        # --- DEBUG probe (remove or gate once auth verified) ---
-        log.warning("[pep] tool=%s principal=%s upn=%s has_claims=%s",
-                    tool_name, principal, upn, bool(_claims()))
+        # Per-call auth probe, gated behind CW_DEBUG_AUTH (off in production).
+        from cwpsa.auth.debug import DEBUG_AUTH
+        if DEBUG_AUTH:
+            log.debug("[pep] tool=%s principal=%s upn=%s has_claims=%s",
+                      tool_name, principal, upn, bool(_claims()))
 
         # 1. Global write kill-switch (belt-and-suspenders over per-tool auth=)
         if _is_write_tool(tool_name):

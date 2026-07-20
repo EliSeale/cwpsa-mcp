@@ -1,7 +1,7 @@
 """
 Verbose request / auth debug logging (§10.2 troubleshooting).
 
-Toggle with CW_DEBUG_AUTH (default ON). Set CW_DEBUG_AUTH=0 to silence once the
+Toggle with CW_DEBUG_AUTH (default OFF). Set CW_DEBUG_AUTH=1 to enable while
 auth chain is verified — this logs identity metadata and should not run forever
 in production.
 
@@ -33,7 +33,7 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 log = logging.getLogger("cwpsa.debug.auth")
 
-DEBUG_AUTH: bool = os.getenv("CW_DEBUG_AUTH", "1").lower() not in ("0", "false", "no", "off", "")
+DEBUG_AUTH: bool = os.getenv("CW_DEBUG_AUTH", "0").lower() in ("1", "true", "yes", "on")
 
 # Claims worth seeing when diagnosing "anonymous / no UPN / app-only token".
 _IDENTITY_CLAIMS = (
