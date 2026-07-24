@@ -55,6 +55,17 @@ if _vault_url:
     _kv = SecretClient(vault_url=_vault_url, credential=_credential)
 
 
+def get_azure_credential() -> DefaultAzureCredential:
+    """Return the shared managed-identity credential.
+
+    Used by subsystems that authenticate to Azure data planes with the
+    Container App's managed identity (RBAC) rather than a stored key —
+    e.g. the RAG search client's Search Index Data Reader access (§6 of the
+    RAG plan).  Reusing one credential keeps the token cache shared.
+    """
+    return _credential
+
+
 def get_secret(name: str, default: str | None = None) -> str:
     """Fetch a secret from Key Vault.
 
@@ -173,6 +184,46 @@ LOAD_VOCABULARY: bool = os.getenv("CW_LOAD_VOCABULARY", "1") != "0"
 WRITES_DISABLED: bool = os.getenv("CW_WRITES_DISABLED", "0").lower() in ("1", "true", "yes", "on")
 OKF_BUNDLE_PATH: str = os.getenv("OKF_BUNDLE_PATH", "business-knowledge")
 REDIS_URL: str | None = os.getenv("REDIS_URL")
+
+# ---------------------------------------------------------------------------
+# RAG / semantic search (Azure AI Search) — see docs/Cwpsa_mcp_rag_search_plan.md
+# ---------------------------------------------------------------------------
+# The RAG subsystem is a DISCOVERY layer only: it returns record IDs + evidence
+# snippets, never authoritative field values. Hydration against ConnectWise under
+# the caller's impersonated member is the truth-and-access boundary (§1, §5, §6).
+#
+# Auth is RBAC via the Container App's managed identity (Search Index Data Reader),
+# NOT an admin/query key — so there is no search API key to store (§6). The endpoint
+# is the only configuration and may live in Key Vault (azure-search-endpoint-01-mcp)
+# or the environment (AZURE_SEARCH_ENDPOINT). When it is unset the cw_search tool
+# reports upstream_unavailable rather than failing to load.
+AZURE_SEARCH_ENDPOINT: str = get_secret(
+    "azure-search-endpoint-01-mcp", os.getenv("AZURE_SEARCH_ENDPOINT", "")
+).rstrip("/")
+
+# Data-plane REST api-version. 2024-07-01 is the stable version that supports
+# integrated vectorization (vectorQueries kind="text") + semantic ranking (§3, §13).
+AZURE_SEARCH_API_VERSION: str = os.getenv("AZURE_SEARCH_API_VERSION", "2024-07-01")
+
+# RBAC token scope for the Azure AI Search data plane.
+AZURE_SEARCH_SCOPE: str = os.getenv(
+    "AZURE_SEARCH_SCOPE", "https://search.azure.com/.default"
+)
+
+# Feature flag — search is only offered when an endpoint is configured.
+RAG_SEARCH_ENABLED: bool = bool(AZURE_SEARCH_ENDPOINT) and os.getenv(
+    "CW_RAG_SEARCH_DISABLED", "0"
+).lower() not in ("1", "true", "yes", "on")
+
+# Hydration governance (§5, §13): hydrate_limit is agent-controlled but hard-capped
+# server-side so an over-eager request cannot blow the response budget with large
+# note bodies. top_k feeds the semantic reranker (Azure reranks up to 50, §3).
+SEARCH_HYDRATE_DEFAULT: int = int(os.getenv("CW_SEARCH_HYDRATE_DEFAULT", "5"))
+SEARCH_HYDRATE_CEILING: int = int(os.getenv("CW_SEARCH_HYDRATE_CEILING", "25"))
+SEARCH_TOP_K_DEFAULT: int = int(os.getenv("CW_SEARCH_TOP_K_DEFAULT", "20"))
+SEARCH_TOP_K_CEILING: int = int(os.getenv("CW_SEARCH_TOP_K_CEILING", "50"))
+# Evidence caption/snippet truncation length (§4, §9 — keep evidence minimal).
+SEARCH_CAPTION_MAX_CHARS: int = int(os.getenv("CW_SEARCH_CAPTION_MAX_CHARS", "400"))
 
 # Local dev impersonation: when running in stdio/unauthenticated mode, the broker
 # mints a token for this UPN instead of deriving it from the Entra JWT.

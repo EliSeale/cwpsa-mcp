@@ -40,6 +40,8 @@ def register(mcp: FastMCP) -> None:
             entity: The entity path, e.g. "service/tickets", "company/companies",
                     "time/entries", "finance/agreements".
                     Call cw_describe with entity="?" to list all available entities.
+                    Call cw_describe with entity="?search" to list which entities are
+                    searchable via cw_search and what filter fields each index supports.
             full:   False (default) returns the lean default projection fields only.
                     True returns all fields including low-rank ones.
 
@@ -49,8 +51,22 @@ def register(mcp: FastMCP) -> None:
             default_projection: recommended fields for list views
             fields:             {field_name: {type, filterable, sortable, values?, ref_entity?}}
             custom_fields:      tenant-defined custom fields (merged from live API)
+            search:             (when the entity is searchable) the cw_search surface —
+                                the short entity name and supported semantic filter fields
         """
         registry = get_registry()
+
+        # List the semantic-search surface (which entities cw_search can query, §2)
+        if entity in ("?search", "search?", "searchable", "?rag"):
+            from cwpsa.search.registry import searchable_entities
+            return {
+                "searchable_entities": searchable_entities(),
+                "hint": (
+                    "Pass one of these to cw_search(entity=...). Filters compile "
+                    "server-side to the index query; use the listed filter fields. "
+                    "cw_search returns candidate IDs + evidence, then hydrates live."
+                ),
+            }
 
         # List all entities
         if entity in ("?", "", "list"):
@@ -86,10 +102,30 @@ def register(mcp: FastMCP) -> None:
                 if name in proj_set or meta.rank >= 3.0
             }
 
+        # Is this entity semantically searchable? (surface the cw_search filters, §2)
+        from cwpsa.search.registry import get_search_entity
+        se = get_search_entity(entity)
+        search_block = None
+        if se is not None:
+            search_block = {
+                "entity": se.entity,
+                "index": se.index,
+                "usage": (
+                    f"cw_search(entity=\"{se.entity}\", query=..., filters=...) — "
+                    "semantic/hybrid search; returns candidate IDs + evidence, then "
+                    "hydrates live under your ConnectWise role."
+                ),
+                "filter_fields": {
+                    name: {"type": ff.type, "description": ff.description}
+                    for name, ff in sorted(se.filters.items())
+                },
+            }
+
         return {
             "entity": record.entity,
             "operations": record.operations,
             "default_projection": record.default_projection,
+            **({"search": search_block} if search_block else {}),
             "fields": {
                 name: {
                     "type": meta.type,
